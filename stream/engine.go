@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync/atomic"
+	"time"
 )
 
 // Config 配置引擎行为。
@@ -14,6 +15,14 @@ type Config struct {
 	InputBuffer     int   // 有界输入缓冲（事件条数）
 	OutputBuffer    int   // 有界输出缓冲（窗口结果条数）
 	Logger          *log.Logger
+
+	// 运行中定期存档（不停机检查点）。Checkpoints 为 nil 时禁用。
+	// 存档在 Run 的处理循环内生成，与事件处理串行，快照天然一致，
+	// 不阻塞事件接收（缓冲未满时），也不改变任何分组的输出顺序。
+	Checkpoints        *GenerationStore // 代际存档存储
+	CheckpointInterval time.Duration    // 按时间间隔存档，<=0 禁用
+	CheckpointEvery    int64            // 每确认 N 条事件存档一次，<=0 禁用
+	CheckpointOnStop   bool             // 停止前排空输入后落最终一代存档
 }
 
 func (c Config) withDefaults() Config {
@@ -45,6 +54,8 @@ type Engine struct {
 	rejects chan Rejection
 
 	offsets map[string]int64 // 每个分组已确认处理的最大 Seq（重放按分组去重）
+
+	sinceCheckpoint int64 // 距上一次存档已确认的事件数
 
 	watermarkPub atomic.Int64 // 对外可观测的水位线镜像
 }
@@ -87,26 +98,72 @@ func (e *Engine) Results() <-chan WindowResult { return e.out }
 func (e *Engine) Rejections() <-chan Rejection { return e.rejects }
 
 // Run 启动处理循环。ctx 取消后排空输入缓冲再退出，不丢弃已提交事件。
+// 配置了 Checkpoints 时，运行中按时间间隔/处理量定期落代际存档，
+// 停止前（CheckpointOnStop）再落最终一代。
 func (e *Engine) Run(ctx context.Context) error {
 	defer close(e.out)
 	defer close(e.rejects)
+
+	var tick <-chan time.Time
+	if e.cfg.Checkpoints != nil && e.cfg.CheckpointInterval > 0 {
+		t := time.NewTicker(e.cfg.CheckpointInterval)
+		defer t.Stop()
+		tick = t.C
+	}
+
 	for {
 		select {
 		case ev := <-e.in:
 			e.process(ctx, ev)
+			e.maybeCheckpoint()
+		case <-tick:
+			e.saveCheckpoint("interval")
 		case <-ctx.Done():
 			// 排空输入缓冲：已提交的事件不得因取消而丢失。
 			for {
 				select {
 				case ev := <-e.in:
 					e.process(context.Background(), ev)
+					e.maybeCheckpoint()
 				default:
+					if e.cfg.CheckpointOnStop {
+						e.saveCheckpoint("shutdown")
+					}
 					e.log("engine stopped: %v", ctx.Err())
 					return ctx.Err()
 				}
 			}
 		}
 	}
+}
+
+// maybeCheckpoint 按处理量触发存档（CheckpointEvery > 0 时每确认 N 条事件一次）。
+func (e *Engine) maybeCheckpoint() {
+	if e.cfg.Checkpoints == nil || e.cfg.CheckpointEvery <= 0 {
+		return
+	}
+	e.sinceCheckpoint++
+	if e.sinceCheckpoint >= e.cfg.CheckpointEvery {
+		e.saveCheckpoint("count")
+	}
+}
+
+// saveCheckpoint 在处理循环内生成一致快照并落为新一代存档。
+// 写失败只记录指标与日志，不中断处理（旧代际仍可用于恢复）。
+func (e *Engine) saveCheckpoint(reason string) {
+	if e.cfg.Checkpoints == nil {
+		return
+	}
+	gen, err := e.cfg.Checkpoints.Save(e.Snapshot())
+	if err != nil {
+		e.metrics.CheckpointErrors.Add(1)
+		e.log("checkpoint (%s) failed: %v", reason, err)
+		return
+	}
+	e.sinceCheckpoint = 0
+	e.metrics.Checkpoints.Add(1)
+	e.log("checkpoint (%s) saved as generation %d: watermark=%d accepted=%d",
+		reason, gen, e.wm.Watermark(), e.metrics.Accepted.Load())
 }
 
 // process 处理单条事件：去重 → 延迟判定 → 并入窗口 → 推进水位线 → 触发窗口。
@@ -201,6 +258,21 @@ func (e *Engine) Restore(c Checkpoint) error {
 	e.log("restored from checkpoint: offsets=%v watermark=%d keys=%d",
 		c.Offsets, c.Watermark, len(c.States))
 	return nil
+}
+
+// RestoreLatest 从代际存档中自动选择最新可用一代恢复：
+// 最新一代损坏、版本不兼容或位点回退时逐代回退到更旧的可用存档，
+// 不会拿残缺状态凑合继续跑。返回的报告说明最终选用了哪一代、跳过了哪些及各自原因。
+func (e *Engine) RestoreLatest(gs *GenerationStore) (RecoveryReport, error) {
+	report, err := gs.Recover()
+	if err != nil {
+		return report, err
+	}
+	if err := e.Restore(report.Checkpoint); err != nil {
+		return report, err
+	}
+	e.log("restored from generation %d (skipped %d unusable)", report.Generation, len(report.Skipped))
+	return report, nil
 }
 
 func (e *Engine) log(format string, args ...any) {

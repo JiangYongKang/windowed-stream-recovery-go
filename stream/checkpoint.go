@@ -67,27 +67,70 @@ func NewFileStore(path string, minOffset int64) *FileStore {
 	return &FileStore{Path: path, MinOffset: minOffset}
 }
 
+// encodeCheckpoint 序列化检查点为带 CRC32 校验和的封装字节。
+func encodeCheckpoint(c Checkpoint) ([]byte, error) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: marshal: %w", err)
+	}
+	payload, err := json.Marshal(filePayload{Data: data, Checksum: crc32.ChecksumIEEE(data)})
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint: marshal payload: %w", err)
+	}
+	return payload, nil
+}
+
+// decodeCheckpoint 解析并严格校验封装字节：损坏（CRC 不符/JSON 不完整）
+// 会以 ErrCheckpointCorrupt 被拒绝。
+func decodeCheckpoint(raw []byte) (Checkpoint, error) {
+	var p filePayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return Checkpoint{}, fmt.Errorf("%w: bad envelope: %v", ErrCheckpointCorrupt, err)
+	}
+	if crc32.ChecksumIEEE(p.Data) != p.Checksum {
+		return Checkpoint{}, fmt.Errorf("%w: checksum mismatch", ErrCheckpointCorrupt)
+	}
+	var c Checkpoint
+	if err := json.Unmarshal(p.Data, &c); err != nil {
+		return Checkpoint{}, fmt.Errorf("%w: bad body: %v", ErrCheckpointCorrupt, err)
+	}
+	return c, nil
+}
+
+// writeFileAtomic 先写临时文件并落盘，再原子替换目标文件，避免半截文件。
+func writeFileAtomic(path string, payload []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("checkpoint: write tmp: %w", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		f.Close()
+		return fmt.Errorf("checkpoint: write tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("checkpoint: sync tmp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("checkpoint: close tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("checkpoint: rename: %w", err)
+	}
+	return nil
+}
+
 // Save 校验并原子写入检查点。
 func (fs *FileStore) Save(c Checkpoint) error {
 	if err := c.validate(fs.MinOffset); err != nil {
 		return err
 	}
-	data, err := json.Marshal(c)
+	payload, err := encodeCheckpoint(c)
 	if err != nil {
-		return fmt.Errorf("checkpoint: marshal: %w", err)
+		return err
 	}
-	payload, err := json.Marshal(filePayload{Data: data, Checksum: crc32.ChecksumIEEE(data)})
-	if err != nil {
-		return fmt.Errorf("checkpoint: marshal payload: %w", err)
-	}
-	tmp := fs.Path + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o644); err != nil {
-		return fmt.Errorf("checkpoint: write tmp: %w", err)
-	}
-	if err := os.Rename(tmp, fs.Path); err != nil {
-		return fmt.Errorf("checkpoint: rename: %w", err)
-	}
-	return nil
+	return writeFileAtomic(fs.Path, payload)
 }
 
 // Load 读取并严格校验检查点：不存在、损坏（CRC 不符/JSON 不完整）、
@@ -100,16 +143,9 @@ func (fs *FileStore) Load() (Checkpoint, error) {
 		}
 		return Checkpoint{}, fmt.Errorf("checkpoint: read: %w", err)
 	}
-	var p filePayload
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return Checkpoint{}, fmt.Errorf("%w: bad envelope: %v", ErrCheckpointCorrupt, err)
-	}
-	if crc32.ChecksumIEEE(p.Data) != p.Checksum {
-		return Checkpoint{}, fmt.Errorf("%w: checksum mismatch", ErrCheckpointCorrupt)
-	}
-	var c Checkpoint
-	if err := json.Unmarshal(p.Data, &c); err != nil {
-		return Checkpoint{}, fmt.Errorf("%w: bad body: %v", ErrCheckpointCorrupt, err)
+	c, err := decodeCheckpoint(raw)
+	if err != nil {
+		return Checkpoint{}, err
 	}
 	if err := c.validate(fs.MinOffset); err != nil {
 		return Checkpoint{}, err
